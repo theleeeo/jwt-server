@@ -1,19 +1,26 @@
 use core::fmt;
 use std::sync::Arc;
 
+use axum::{
+    async_trait,
+    extract::{FromRequestParts, State},
+    http::{request::Parts, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, RequestPartsExt, Router,
+};
 use chrono::prelude::*;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use warp::{
-    filters::header::headers_cloned,
-    http::header::{HeaderMap, HeaderValue, AUTHORIZATION},
-    reject, reply, Filter, Rejection, Reply,
+use serde_json::json;
+
+use axum_extra::{
+    headers::{authorization::Bearer, Authorization},
+    TypedHeader,
 };
 
-use crate::error::Error;
-use crate::{LoginRequest, LoginResponse, Users, WebResult};
-
-const BEARER: &str = "Bearer ";
+use crate::AppState;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub enum Role {
@@ -48,144 +55,135 @@ pub struct Claims {
 }
 
 pub struct Authorizer {
-    encoding_key: EncodingKey,
-    decoding_key: DecodingKey,
+    keys: Keys,
     valid_duration: chrono::Duration,
 }
 
 impl Authorizer {
     pub fn new(secret: &[u8], valid_duration: i64) -> Authorizer {
         Authorizer {
-            encoding_key: EncodingKey::from_secret(secret),
-            decoding_key: DecodingKey::from_secret(secret),
+            keys: Keys::new(secret),
             valid_duration: chrono::Duration::seconds(valid_duration),
         }
     }
+}
 
-    pub fn create_token(&self, uid: &str, role: &Role) -> Result<String, Error> {
-        let expiration = Utc::now()
-            .checked_add_signed(self.valid_duration)
-            .expect("invalid timestamp") // safe to unwrap because it should always valid
-            .timestamp();
-
-        let claims = Claims {
-            uid: uid.to_owned(),
-            role: role.clone(),
-            exp: expiration,
-        };
-
-        jsonwebtoken::encode(
-            &Header::new(Algorithm::default()),
-            &claims,
-            &self.encoding_key,
-        )
-        .map_err(|_| Error::JwtFailure)
+async fn login_handler(
+    state: State<Arc<AppState>>,
+    Json(payload): Json<AuthPayload>,
+) -> Result<String, AuthError> {
+    // Check if the user sent the credentials
+    if payload.username.is_empty() || payload.password.is_empty() {
+        return Err(AuthError::NoCredentials);
     }
-}
 
-pub fn must_auth(
-    auth: Arc<Authorizer>,
-    role: Role,
-) -> impl Filter<Extract = (String,), Error = Rejection> + Clone {
-    headers_cloned()
-        .map(move |headers: HeaderMap<HeaderValue>| (role.clone(), headers))
-        .and_then(move |(role, headers)| authorize(Arc::clone(&auth), (role, headers)))
-}
+    // Here you can check the user credentials from a database
+    if payload.username != "foo" || payload.password != "bar" {
+        return Err(AuthError::NoCredentials);
+    }
 
-pub fn extract_claims(
-    auth: Arc<Authorizer>,
-) -> impl Filter<Extract = (Claims,), Error = Rejection> + Clone {
-    headers_cloned().and_then(move |headers| get_claims(Arc::clone(&auth), headers))
-}
-
-async fn get_claims(
-    auth: Arc<Authorizer>,
-    headers: HeaderMap<HeaderValue>,
-) -> Result<Claims, Rejection> {
-    let token = token_from_header(&headers).ok_or(reject::custom(Error::InvalidAuthHeader))?;
-    let claims = match jsonwebtoken::decode::<Claims>(
-        &token,
-        &auth.decoding_key,
-        &Validation::new(Algorithm::default()),
-    ) {
-        Ok(token_data) => token_data.claims,
-        Err(_) => return Err(reject::custom(Error::JwtFailure)),
+    let claims = Claims {
+        uid: "123".to_string(),
+        role: Role::Admin,
+        // Mandatory expiry time as UTC timestamp
+        exp: Utc::now().timestamp() + state.authorizer.valid_duration.num_seconds(),
     };
 
-    if claims.exp < Utc::now().timestamp() {
-        return Err(reject::custom(Error::Unauthorized));
-    }
+    // Create the authorization token
+    let token = jsonwebtoken::encode(&Header::default(), &claims, &state.authorizer.keys.encoding)
+        .map_err(|_| AuthError::TokenFailure)?;
 
-    Ok(claims)
+    // Send the authorized token
+    Ok(token)
 }
 
-pub fn with_auth(
-    auth: Arc<Authorizer>,
-) -> impl Filter<Extract = (Arc<Authorizer>,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || Arc::clone(&auth))
-}
-
-async fn authorize(
-    auth: Arc<Authorizer>,
-    (role, headers): (Role, HeaderMap<HeaderValue>),
-) -> WebResult<String> {
-    match token_from_header(&headers) {
-        Some(token) => {
-            let claims = match jsonwebtoken::decode::<Claims>(
-                &token,
-                &auth.decoding_key,
-                &Validation::new(Algorithm::HS512),
-            ) {
-                Ok(token_data) => token_data.claims,
-                Err(_) => return Err(reject::custom(Error::JwtFailure)),
-            };
-
-            if claims.exp < Utc::now().timestamp() {
-                return Err(reject::custom(Error::Unauthorized));
-            }
-
-            if role == Role::Admin && claims.role != role {
-                return Err(reject::custom(Error::Forbidden));
-            }
-
-            Ok(claims.uid)
-        }
-
-        None => Err(reject::custom(Error::InvalidAuthHeader)),
-    }
-}
-
-fn token_from_header(headers: &HeaderMap<HeaderValue>) -> Option<String> {
-    let auth_header = headers.get(AUTHORIZATION)?;
-    let auth_header = auth_header.to_str().ok()?;
-    if !auth_header.starts_with(BEARER) {
-        return None;
-    }
-    Some(auth_header.trim_start_matches(BEARER).to_string())
-}
-
-pub async fn login_handler(
-    auth: Arc<Authorizer>,
-    users: Users,
-    req: LoginRequest,
-) -> WebResult<impl Reply> {
-    let user = users
-        .iter()
-        .find(|u| u.username == req.username && u.pwd == req.pwd);
-    match user {
-        Some(user) => {
-            let token = auth
-                .create_token(
-                    &user.uid,
-                    &Role::parse(&user.role).ok_or(Error::UnknownRole)?,
-                )
-                .map_err(reject::custom)?;
-            Ok(reply::json(&LoginResponse { token }))
-        }
-        None => Err(reject::custom(Error::Unauthorized)),
-    }
-}
-
-pub async fn whoami_handler(claims: Claims) -> WebResult<impl Reply> {
+async fn whoami_handler(claims: Claims, state: State<Arc<AppState>>) -> Result<String, AuthError> {
+    // let token = token_from_header(&headers).ok_or(Error::InvalidAuthHeader)?;
+    // let claims = get_claims(&state.authorizer, &token)?;
     Ok(format!("id: {}, role: {}", claims.uid, claims.role))
+}
+
+pub fn router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/whoami", get(whoami_handler))
+        .route("/login", post(login_handler))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthPayload {
+    username: String,
+    password: String,
+}
+
+struct Keys {
+    encoding: EncodingKey,
+    decoding: DecodingKey,
+}
+
+impl Keys {
+    fn new(secret: &[u8]) -> Self {
+        Self {
+            encoding: EncodingKey::from_secret(secret),
+            decoding: DecodingKey::from_secret(secret),
+        }
+    }
+}
+
+static KEYS: Lazy<Keys> = Lazy::new(|| {
+    // let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let secret = "secret";
+    Keys::new(secret.as_bytes())
+});
+
+#[async_trait]
+impl<S> FromRequestParts<S> for Claims
+where
+    S: Send + Sync,
+{
+    type Rejection = AuthError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // Extract the token from the authorization header
+        let TypedHeader(Authorization(bearer)) = parts
+            .extract::<TypedHeader<Authorization<Bearer>>>()
+            .await
+            .map_err(|_| AuthError::InvalidAuthHeader)?;
+        // Decode the user data
+        let token_data =
+            jsonwebtoken::decode::<Claims>(bearer.token(), &KEYS.decoding, &Validation::default())
+                .map_err(|_| AuthError::InvalidToken)?;
+
+        if token_data.claims.exp < Utc::now().timestamp() {
+            return Err(AuthError::ExpiredToken);
+        }
+
+        Ok(token_data.claims)
+    }
+}
+
+pub enum AuthError {
+    InvalidAuthHeader,
+    InvalidToken,
+    ExpiredToken,
+    NoCredentials,
+    TokenFailure,
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        let (status, error_message) = match self {
+            AuthError::InvalidAuthHeader => {
+                (StatusCode::UNAUTHORIZED, "Invalid authorization header")
+            }
+            AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid token"),
+            AuthError::ExpiredToken => (StatusCode::UNAUTHORIZED, "Token is expired"),
+            AuthError::NoCredentials => (
+                StatusCode::UNAUTHORIZED,
+                "Incomplete or missing credentials",
+            ),
+            AuthError::TokenFailure => (StatusCode::INTERNAL_SERVER_ERROR, "Token creation error"),
+        };
+        let body = Json(json!({ "message": error_message }));
+        (status, body).into_response()
+    }
 }
